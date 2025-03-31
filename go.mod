@@ -3,6 +3,7 @@ module duckdb-go
 go 1.21
 
 require (
+	github.com/bits-and-blooms/bitset v1.22.0
 	github.com/huandu/go-clone v1.7.2
 	github.com/stretchr/testify v1.10.0
 	github.com/xlab/treeprint v1.2.0
