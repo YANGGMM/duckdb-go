@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+
+	"github.com/xlab/treeprint"
 )
 
 type BindingType int
@@ -46,6 +48,14 @@ func (b *Binding) Format(ctx *FormatCtx) {
 	}
 }
 
+func (b *Binding) Print(tree treeprint.Tree) {
+	tree = tree.AddMetaBranch(fmt.Sprintf("%s, %d", b.typ, b.index), fmt.Sprintf("%s.%s", b.database, b.alias))
+	sub := tree.AddBranch("columns")
+	for i, n := range b.names {
+		sub.AddNode(fmt.Sprintf("%d %s %s", i, n, b.typs[i]))
+	}
+}
+
 func (b *Binding) Bind(table, column string, depth int) (*Expr, error) {
 	if idx, ok := b.nameMap[column]; ok {
 		exp := &Expr{
@@ -84,6 +94,12 @@ func NewBindContext(parent *BindContext) *BindContext {
 func (bc *BindContext) Format(ctx *FormatCtx) {
 	for _, b := range bc.bindings {
 		b.Format(ctx)
+	}
+}
+
+func (bc *BindContext) Print(tree treeprint.Tree) {
+	for _, b := range bc.bindings {
+		b.Print(tree)
 	}
 }
 
@@ -178,6 +194,7 @@ type Builder struct {
 	tag        int // relation tag
 	projectTag int
 	groupTag   int
+	aggTag     int
 	rootCtx    *BindContext
 
 	//alias of select expr -> idx of select expr
@@ -219,6 +236,7 @@ func (b *Builder) Format(ctx *FormatCtx) {
 	ctx.Writefln("tag %d", b.tag)
 	ctx.Writefln("projectTag %d", b.projectTag)
 	ctx.Writefln("groupTag %d", b.groupTag)
+	ctx.Writefln("aggTag %d", b.aggTag)
 
 	ctx.Writeln("aliasMap:")
 	WriteMap(ctx, b.aliasMap)
@@ -251,10 +269,55 @@ func (b *Builder) Format(ctx *FormatCtx) {
 	ctx.Writefln("%d", b.columnCount)
 }
 
+func (b *Builder) Print(tree treeprint.Tree) {
+	if b == nil {
+		return
+	}
+	if b.rootCtx != nil {
+		sub := tree.AddBranch("bindings:")
+		b.rootCtx.Print(sub)
+	}
+
+	tree.AddNode(fmt.Sprintf("tag %d", b.tag))
+	tree.AddNode(fmt.Sprintf("projectTag %d", b.projectTag))
+	tree.AddNode(fmt.Sprintf("groupTag %d", b.groupTag))
+	tree.AddNode(fmt.Sprintf("aggTag %d", b.aggTag))
+
+	sub := tree.AddBranch("aliasMap:")
+	WriteMapTree(sub, b.aliasMap)
+
+	sub = tree.AddBranch("projectMap:")
+	WriteMapTree(sub, b.projectMap)
+
+	sub = tree.AddBranch("projectExprs:")
+	WriteExprsTree(sub, b.projectExprs)
+
+	sub = tree.AddBranch("fromExpr:")
+	WriteExprTree(sub, b.fromExpr)
+
+	sub = tree.AddBranch("whereExpr:")
+	WriteExprTree(sub, b.whereExpr)
+
+	sub = tree.AddBranch("groupbyExprs:")
+	WriteExprsTree(sub, b.groupbyExprs)
+
+	sub = tree.AddBranch("orderbyExprs:")
+	WriteExprsTree(sub, b.orderbyExprs)
+
+	sub = tree.AddBranch("limitCount:")
+	WriteExprTree(sub, b.limitCount)
+
+	sub = tree.AddBranch("names:")
+	sub.AddNode(b.names)
+
+	sub = tree.AddBranch("columnCount:")
+	sub.AddNode(fmt.Sprintf("%d", b.columnCount))
+}
+
 func (b *Builder) String() string {
-	ctx := &FormatCtx{}
-	b.Format(ctx)
-	return ctx.String()
+	tree := treeprint.NewWithRoot("Builder:")
+	b.Print(tree)
+	return tree.String()
 }
 
 func (b *Builder) GetTag() int {
@@ -266,6 +329,7 @@ func (b *Builder) buildSelect(sel *Ast, ctx *BindContext, depth int) error {
 	var err error
 	b.projectTag = b.GetTag()
 	b.groupTag = b.GetTag()
+	b.aggTag = b.GetTag()
 
 	//from
 	b.fromExpr, err = b.buildTable(sel.Select.From.Tables, ctx)
@@ -376,6 +440,7 @@ func (b *Builder) buildTable(table *Ast, ctx *BindContext) (*Expr, error) {
 
 			return &Expr{
 				Typ:       ET_TABLE,
+				Index:     b.index,
 				Database:  db,
 				Table:     table,
 				BelongCtx: ctx,
@@ -481,6 +546,7 @@ func (b *Builder) createFrom(expr *Expr, root *LogicalOperator) (*LogicalOperato
 	case ET_TABLE:
 		return &LogicalOperator{
 			Typ:       LOT_Scan,
+			Index:     expr.Index,
 			Database:  expr.Database,
 			Table:     expr.Table,
 			BelongCtx: expr.BelongCtx,
@@ -496,8 +562,8 @@ func (b *Builder) createFrom(expr *Expr, root *LogicalOperator) (*LogicalOperato
 		}
 		jt := LOT_JoinTypeCross
 		switch expr.JoinTyp {
-		case ET_JoinTypeCross:
-			jt = LOT_JoinTypeCross
+		case ET_JoinTypeCross, ET_JoinTypeInner:
+			jt = LOT_JoinTypeInner
 		case ET_JoinTypeLeft:
 			jt = LOT_JoinTypeLeft
 		default:
@@ -603,6 +669,7 @@ func (b *Builder) apply(expr *Expr, root, subRoot *LogicalOperator) (*Expr, *Log
 		panic("must be subquery")
 	}
 	corrExprs := collectCorrFilter(subRoot)
+	//collect correlated columns
 	corrCols := make([]*Expr, 0)
 	for _, corr := range corrExprs {
 		corrCols = append(corrCols, collectCorrColumn(corr)...)
@@ -612,26 +679,6 @@ func (b *Builder) apply(expr *Expr, root, subRoot *LogicalOperator) (*Expr, *Log
 		newSub, err := b.applyImpl(corrExprs, corrCols, root, subRoot)
 		if err != nil {
 			return nil, nil, err
-		}
-
-		//remove cor column
-		nonCorrExprs, newCorrExprs := removeCorrExprs(corrExprs)
-
-		newRoot := &LogicalOperator{
-			Typ:     LOT_JOIN,
-			JoinTyp: LOT_JoinTypeInner,
-			OnConds: nonCorrExprs,
-			Children: []*LogicalOperator{
-				root, newSub,
-			},
-		}
-
-		if len(newCorrExprs) > 0 {
-			newRoot = &LogicalOperator{
-				Typ:      LOT_Filter,
-				Filters:  newCorrExprs,
-				Children: []*LogicalOperator{newRoot},
-			}
 		}
 
 		//TODO: may have multi columns
@@ -648,7 +695,7 @@ func (b *Builder) apply(expr *Expr, root, subRoot *LogicalOperator) (*Expr, *Log
 			},
 		}
 
-		return colRef, newRoot, nil
+		return colRef, newSub, nil
 	} else {
 		newRoot := &LogicalOperator{
 			Typ:     LOT_JOIN,
@@ -675,15 +722,68 @@ func (b *Builder) apply(expr *Expr, root, subRoot *LogicalOperator) (*Expr, *Log
 	}
 }
 
+// TODO: wrong impl.
+// need add function: check LogicalOperator has cor column
 func (b *Builder) applyImpl(corrExprs []*Expr, corrCols []*Expr, root, subRoot *LogicalOperator) (*LogicalOperator, error) {
 	var err error
+	has := hasCorrColInRoot(subRoot)
+	if !has {
+		//remove cor column
+		nonCorrExprs, newCorrExprs := removeCorrExprs(corrExprs)
+
+		//TODO: wrong!!!
+		newRoot := &LogicalOperator{
+			Typ:     LOT_JOIN,
+			JoinTyp: LOT_JoinTypeInner,
+			OnConds: nonCorrExprs,
+			Children: []*LogicalOperator{
+				root, subRoot,
+			},
+		}
+
+		if len(newCorrExprs) > 0 {
+			newRoot = &LogicalOperator{
+				Typ:      LOT_Filter,
+				Filters:  newCorrExprs,
+				Children: []*LogicalOperator{newRoot},
+			}
+		}
+		return newRoot, err
+	}
 	switch subRoot.Typ {
 	case LOT_Project:
-		subRoot.Projects = append(subRoot.Projects, corrCols...)
+		for _, proj := range subRoot.Projects {
+			if hasCorrCol(proj) {
+				panic("usp correlated column in project")
+			}
+		}
+		if has {
+			subRoot.Projects = append(subRoot.Projects, corrCols...)
+		}
 		subRoot.Children[0], err = b.applyImpl(corrExprs, corrCols, root, subRoot.Children[0])
 		return subRoot, err
 	case LOT_AggGroup:
-		subRoot.GroupBys = append(subRoot.GroupBys, corrCols...)
+		for _, by := range subRoot.GroupBys {
+			if hasCorrCol(by) {
+				panic("usp correlated column in agg")
+			}
+		}
+		if has {
+			subRoot.GroupBys = append(subRoot.GroupBys, corrCols...)
+		}
+		subRoot.Children[0], err = b.applyImpl(corrExprs, corrCols, root, subRoot.Children[0])
+		return subRoot, err
+	case LOT_Filter:
+		filterHasCorrCol := false
+		for _, filter := range subRoot.Filters {
+			if hasCorrCol(filter) {
+				filterHasCorrCol = true
+				break
+			}
+		}
+		if has && !filterHasCorrCol {
+			subRoot.Filters = append(subRoot.Filters, corrExprs...)
+		}
 		subRoot.Children[0], err = b.applyImpl(corrExprs, corrCols, root, subRoot.Children[0])
 		return subRoot, err
 	}
@@ -693,6 +793,8 @@ func (b *Builder) applyImpl(corrExprs []*Expr, corrCols []*Expr, root, subRoot *
 func (b *Builder) createAggGroup(root *LogicalOperator) (*LogicalOperator, error) {
 	return &LogicalOperator{
 		Typ:      LOT_AggGroup,
+		Index:    uint64(b.groupTag),
+		Index2:   uint64(b.aggTag),
 		Aggs:     b.aggs,
 		GroupBys: b.groupbyExprs,
 		Children: []*LogicalOperator{root},
@@ -712,6 +814,7 @@ func (b *Builder) createProject(root *LogicalOperator) (*LogicalOperator, error)
 	}
 	return &LogicalOperator{
 		Typ:      LOT_Project,
+		Index:    uint64(b.projectTag),
 		Projects: projects,
 		Children: []*LogicalOperator{root},
 	}, nil
@@ -725,7 +828,8 @@ func (b *Builder) createOrderby(root *LogicalOperator) (*LogicalOperator, error)
 	}, nil
 }
 
-// collectCorrFilter collects all exprs that has correlated column
+// collectCorrFilter collects all exprs that has correlated column.
+// and does not remove these exprs.
 func collectCorrFilter(root *LogicalOperator) []*Expr {
 	var ret, childRet []*Expr
 	for _, child := range root.Children {
@@ -735,15 +839,12 @@ func collectCorrFilter(root *LogicalOperator) []*Expr {
 
 	switch root.Typ {
 	case LOT_Filter:
-		var newFilters []*Expr
 		for _, filter := range root.Filters {
 			if hasCorrCol(filter) {
 				ret = append(ret, filter)
-			} else {
-				newFilters = append(newFilters, filter)
 			}
 		}
-		root.Filters = newFilters
+	default:
 	}
 	return ret
 }
@@ -789,3 +890,260 @@ func hasCorrCol(expr *Expr) bool {
 	}
 	return false
 }
+
+// hasCorrColInRoot checks if the plan with root has the correlated column.
+func hasCorrColInRoot(root *LogicalOperator) bool {
+	switch root.Typ {
+	case LOT_Project:
+		for _, proj := range root.Projects {
+			if hasCorrCol(proj) {
+				panic("usp correlated column in project")
+			}
+		}
+
+	case LOT_AggGroup:
+		for _, by := range root.GroupBys {
+			if hasCorrCol(by) {
+				panic("usp correlated column in agg")
+			}
+		}
+
+	case LOT_Filter:
+		for _, filter := range root.Filters {
+			if hasCorrCol(filter) {
+				return true
+			}
+		}
+	}
+
+	for _, child := range root.Children {
+		if hasCorrColInRoot(child) {
+			return true
+		}
+	}
+	return false
+}
+
+// ==============
+// Optimize plan
+// ==============
+func (b *Builder) Optimize(ctx *BindContext, root *LogicalOperator) (*LogicalOperator, error) {
+	var err error
+	var left []*Expr
+	//1. pushdown filter
+	root, left, err = b.pushdownFilters(root, nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(left) > 0 {
+		root = &LogicalOperator{
+			Typ:      LOT_Filter,
+			Filters:  left,
+			Children: []*LogicalOperator{root},
+		}
+	}
+
+	//2. join order
+	//3. column prune
+	return root, nil
+}
+
+// pushdownFilters pushes down filters to the lowest possible position.
+// It returns the new root and the filters that cannot be pushed down.
+func (b *Builder) pushdownFilters(root *LogicalOperator, filters []*Expr) (*LogicalOperator, []*Expr, error) {
+	var err error
+	var left, childLeft []*Expr
+	var childRoot *LogicalOperator
+	var needs []*Expr
+
+	switch root.Typ {
+	case LOT_Scan:
+		for _, f := range filters {
+			if onlyReferTo(f, root.Index) {
+				//expr that only refer to the scan expr can be pushdown.
+				root.Filters = append(root.Filters, f)
+			} else {
+				left = append(left, f)
+			}
+		}
+	case LOT_JOIN:
+		needs = filters
+		leftTags := make(map[uint64]bool)
+		rightTags := make(map[uint64]bool)
+		collectTags(root.Children[0], leftTags)
+		collectTags(root.Children[1], rightTags)
+
+		root.OnConds = splitExprsByAnd(root.OnConds)
+		if root.JoinTyp == LOT_JoinTypeInner {
+			for _, on := range root.OnConds {
+				needs = append(needs, splitExprByAnd(on)...)
+			}
+			root.OnConds = nil
+		}
+
+		whichSides := make([]int, len(needs))
+		for i, nd := range needs {
+			whichSides[i] = decideSide(nd, leftTags, rightTags)
+		}
+
+		leftNeeds := make([]*Expr, 0)
+		rightNeeds := make([]*Expr, 0)
+		for i, nd := range needs {
+			switch whichSides[i] {
+			case NoneSide:
+				switch root.JoinTyp {
+				case LOT_JoinTypeInner:
+					leftNeeds = append(leftNeeds, copyExpr(nd))
+					rightNeeds = append(rightNeeds, nd)
+				case LOT_JoinTypeLeft:
+					leftNeeds = append(leftNeeds, nd)
+				default:
+					left = append(left, nd)
+				}
+			case LeftSide:
+				leftNeeds = append(leftNeeds, nd)
+			case RightSide:
+				rightNeeds = append(rightNeeds, nd)
+			case BothSide:
+				if root.JoinTyp == LOT_JoinTypeInner {
+					root.OnConds = append(root.OnConds, nd)
+					break
+				}
+				left = append(left, nd)
+			default:
+				panic(fmt.Sprintf("usp side %d", whichSides[i]))
+			}
+		}
+
+		childRoot, childLeft, err = b.pushdownFilters(root.Children[0], leftNeeds)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(childLeft) > 0 {
+			childRoot = &LogicalOperator{
+				Typ:      LOT_Filter,
+				Filters:  childLeft,
+				Children: []*LogicalOperator{childRoot},
+			}
+		}
+		root.Children[0] = childRoot
+
+		childRoot, childLeft, err = b.pushdownFilters(root.Children[1], rightNeeds)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(childLeft) > 0 {
+			childRoot = &LogicalOperator{
+				Typ:      LOT_Filter,
+				Filters:  childLeft,
+				Children: []*LogicalOperator{childRoot},
+			}
+		}
+		root.Children[1] = childRoot
+
+	case LOT_AggGroup:
+		for _, f := range filters {
+			if referTo(f, root.Index2) {
+				//expr that refer to the agg exprs can not be pushdown.
+				root.Filters = append(root.Filters, f)
+			} else {
+				//restore the real expr for the expr that refer to the expr in the group by.
+				needs = append(needs, restoreExpr(f, root.Index, root.GroupBys))
+			}
+		}
+
+		childRoot, childLeft, err = b.pushdownFilters(root.Children[0], needs)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(childLeft) > 0 {
+			childRoot = &LogicalOperator{
+				Typ:      LOT_Filter,
+				Filters:  childLeft,
+				Children: []*LogicalOperator{childRoot},
+			}
+		}
+		root.Children[0] = childRoot
+	case LOT_Project:
+		//restore the real expr for the expr that refer to the expr in the project list.
+		for _, f := range filters {
+			needs = append(needs, restoreExpr(f, root.Index, root.Projects))
+		}
+
+		childRoot, childLeft, err = b.pushdownFilters(root.Children[0], needs)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(childLeft) > 0 {
+			childRoot = &LogicalOperator{
+				Typ:      LOT_Filter,
+				Filters:  childLeft,
+				Children: []*LogicalOperator{childRoot},
+			}
+		}
+		root.Children[0] = childRoot
+	case LOT_Filter:
+		needs = filters
+		for _, e := range root.Filters {
+			needs = append(needs, splitExprByAnd(e)...)
+		}
+		childRoot, childLeft, err = b.pushdownFilters(root.Children[0], needs)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(childLeft) > 0 {
+			root.Children[0] = childRoot
+			root.Filters = childLeft
+		} else {
+			//remove this FILTER node
+			root = childRoot
+		}
+
+	default:
+		if root.Typ == LOT_Limit {
+			//can not pushdown filter through LIMIT
+			left, filters = filters, nil
+		}
+		if len(root.Children) > 0 {
+			if len(root.Children) > 1 {
+				panic("must be on child: " + root.Typ.String())
+			}
+			childRoot, childLeft, err = b.pushdownFilters(root.Children[0], filters)
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(childLeft) > 0 {
+				childRoot = &LogicalOperator{
+					Typ:      LOT_Filter,
+					Filters:  childLeft,
+					Children: []*LogicalOperator{childRoot},
+				}
+			}
+			root.Children[0] = childRoot
+		} else {
+			left = filters
+		}
+	}
+
+	return root, left, err
+}
+
+func collectTags(root *LogicalOperator, set map[uint64]bool) {
+	if root.Index != 0 {
+		set[root.Index] = true
+	}
+	if root.Index2 != 0 {
+		set[root.Index2] = true
+	}
+	for _, child := range root.Children {
+		collectTags(child, set)
+	}
+}
+
+const (
+	NoneSide       = 0
+	LeftSide       = 1 << 1
+	RightSide      = 1 << 2
+	BothSide       = LeftSide | RightSide
+	CorrelatedSide = 1 << 3
+)
