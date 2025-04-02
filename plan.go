@@ -129,6 +129,7 @@ type LogicalOperator struct {
 	GroupBys  []*Expr
 	OrderBys  []*Expr
 	Limit     *Expr
+	Stats     *Stats
 
 	Children []*LogicalOperator
 }
@@ -153,10 +154,14 @@ func (lo *LogicalOperator) Print(tree treeprint.Tree) {
 		tree.AddMetaNode("index", fmt.Sprintf("%d", lo.Index))
 		tree.AddMetaNode("table", fmt.Sprintf("%v.%v", lo.Database, lo.Table))
 		tree.AddMetaNode("filters", listExprs(&bb, lo.Filters).String())
+		tree.AddMetaNode("stats", lo.Stats.String())
 	case LOT_JOIN:
 		tree = tree.AddBranch(fmt.Sprintf("Join (%v):", lo.JoinTyp))
 		if len(lo.OnConds) > 0 {
 			tree.AddMetaNode("On", listExprs(&bb, lo.OnConds).String())
+		}
+		if lo.Stats != nil {
+			tree.AddMetaNode("Stats", lo.Stats.String())
 		}
 	case LOT_AggGroup:
 		tree = tree.AddBranch("Aggregate:")
@@ -355,6 +360,98 @@ func decideSide(e *Expr, leftTags, rightTags map[uint64]bool) int {
 	return ret
 }
 
+func getTableNameFromExprs(exprs map[*Expr]bool) (string, string) {
+	if len(exprs) == 0 {
+		panic("must have exprs")
+	}
+	for e := range exprs {
+		if e.Typ != ET_Column {
+			panic("must be column ref")
+		}
+		return "", e.Table
+	}
+	return "", ""
+}
+
+/*
+dir
+
+	0 left
+	1 right
+*/
+func collectRelation(e *Expr, dir int) (map[uint64]map[*Expr]bool, map[uint64]map[*Expr]bool) {
+	left := make(map[uint64]map[*Expr]bool)
+	right := make(map[uint64]map[*Expr]bool)
+	switch e.Typ {
+	case ET_Column:
+		if dir <= 0 {
+			set := left[e.ColRef[0]]
+			if set == nil {
+				set = make(map[*Expr]bool)
+			}
+			set[e] = true
+			left[e.ColRef[0]] = set
+		} else {
+			set := right[e.ColRef[0]]
+			if set == nil {
+				set = make(map[*Expr]bool)
+			}
+			set[e] = true
+			right[e.ColRef[0]] = set
+		}
+	case ET_And, ET_Equal, ET_Like:
+		for i, child := range e.Children {
+			newDir := 0
+			if i > 0 {
+				newDir = 1
+			}
+			retl, retr := collectRelation(child, newDir)
+			if i == 0 {
+				mergeMap(left, retl)
+			} else {
+				mergeMap(right, retr)
+			}
+		}
+	case ET_Func:
+		for _, child := range e.Children {
+			retl, retr := collectRelation(child, dir)
+			if dir <= 0 {
+				mergeMap(left, retl)
+			} else {
+				mergeMap(right, retr)
+			}
+		}
+	}
+	return left, right
+}
+
+func mergeMap(a, b map[uint64]map[*Expr]bool) {
+	for k, v := range b {
+		set := a[k]
+		if set == nil {
+			a[k] = v
+		} else {
+			mergeSet(set, v)
+		}
+	}
+}
+
+func mergeSet(a, b map[*Expr]bool) {
+	for k, v := range b {
+		a[k] = v
+	}
+}
+
+func printRelations(info string, maps map[uint64]map[*Expr]bool) {
+	fmt.Println(info)
+	for k, v := range maps {
+		fmt.Printf("\trelation %d\n", k)
+		for e := range v {
+			fmt.Printf("\t\t%v\n", e)
+		}
+	}
+}
+
 func copyExpr(e *Expr) *Expr {
 	return clone.Clone(e).(*Expr)
 }
@@ -538,6 +635,23 @@ func (c *Catalog) Table(db, table string) (*CatalogTable, error) {
 	return nil, nil
 }
 
+type Stats struct {
+	RowCount float64
+}
+
+func (s *Stats) Copy() *Stats {
+	return &Stats{
+		RowCount: s.RowCount,
+	}
+}
+
+func (s *Stats) String() string {
+	if s == nil {
+		return ""
+	}
+	return fmt.Sprintf("rowcount %v", s.RowCount)
+}
+
 type CatalogTable struct {
 	Db         string
 	Table      string
@@ -545,6 +659,7 @@ type CatalogTable struct {
 	Types      []ExprDataType
 	PK         []int
 	Column2Idx map[string]int
+	Stats      *Stats
 }
 
 func splitExprByAnd(expr *Expr) []*Expr {
