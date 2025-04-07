@@ -5,7 +5,6 @@ go 1.21
 require (
 	github.com/huandu/go-clone v1.7.2
 	github.com/stretchr/testify v1.10.0
-	github.com/tidwall/btree v1.7.0
 	github.com/xlab/treeprint v1.2.0
 )
 
